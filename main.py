@@ -1,9 +1,11 @@
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 import json
 import os
 import random
-from googletrans import Translator  # Utilisé pour la traduction automatique gratuite
+import requests
+from googletrans import Translator
+from datetime import datetime, timedelta
 
 # --- CONFIGURATION INITIALE ---
 INTENTS = discord.Intents.default()
@@ -54,14 +56,19 @@ def get_user_data(user_id):
             "brigade": "Aucune",
             "victoires_duels": 0,
             "etoiles_michelin": [],
+            "badges_style": [],
             "trophees_debut_saison": 0,
             "trophees_actuels": 0,
             "niveau_cuisine": 1,
             "experience": 0,
-            "specialite": "Aucune",
-            "badges": [],
+            "derniere_activite": datetime.now().isoformat(),
+            "total_gains": 0,
             "historique_duels": [],
-            "total_gains": 0
+            "statistiques": {
+                "duels_joues": 0,
+                "duels_gagnes": 0,
+                "duels_perdus": 0
+            }
         }
         save_data(data)
     return data[uid]
@@ -77,20 +84,29 @@ def update_user_data(user_id, key, value):
 
 @bot.event
 async def on_ready():
-    print(f"Le chef {bot.user.name} est en cuisine et prêt à servir !")
+    print(f"🍽️ Le chef {bot.user.name} est en cuisine et gère tout le restaurant !")
     try:
         synced = await bot.tree.sync()
-        print(f"Commandes Slash synchronisées : {len(synced)}")
+        print(f"✅ Commandes Slash synchronisées : {len(synced)}")
     except Exception as e:
-        print(e)
+        print(f"❌ Erreur lors de la synchronisation : {e}")
+    
+    if not suivi_activite.is_running():
+        suivi_activite.start()
 
 
-# --- 0. TRADUCTION INVISIBLE AUTOMATIQUE (Réaction 🌐) ---
+# --- 1. TRADUCTION INVISIBLE AUTOMATIQUE (Réaction 🌐) ---
 @bot.event
 async def on_message(message):
     if message.author.bot:
         return
     
+    u_data = get_user_data(message.author.id)
+    u_data["derniere_activite"] = datetime.now().isoformat()
+    data = load_data()
+    data[str(message.author.id)] = u_data
+    save_data(data)
+
     try:
         detected = translator.detect(message.content)
         if detected.lang != 'fr' and len(message.content) > 3:
@@ -118,72 +134,77 @@ async def on_reaction_add(reaction, user):
             pass
 
 
-# --- 1. CHOIX DE LA BRIGADE (Menu Déroulant) ---
-class BrigadeSelect(discord.ui.Select):
+# --- 2. ANIMAUX ZOOBA & CONFIGURATION DU PROFIL ---
+ANIMAUX_ZOOBA = [
+    "Bruce 🦍", "Nix 🦊", "Duke 🦁", "Buck 🦌", 
+    "Fuzzy 🐨", "Larry 🦒", "Pepper 🦝", "Jade 🐍", 
+    "Steve 🦈", "Shelly 🐢", "Finn 🦈", "Pebbles 🦘"
+]
+
+class AnimalSelect(discord.ui.Select):
     def __init__(self):
-        options = [
-            discord.SelectOption(label="La Brigade des Viandes 🥩", description="Les Tanks (Bruce, Duke, Buck...) - Frontlane", value="La Brigade des Viandes 🥩"),
-            discord.SelectOption(label="Les Chefs Poissonniers 🐟", description="Les DPS / Assassins (Nix, Jade, Steve...)", value="Les Chefs Poissonniers 🐟"),
-            discord.SelectOption(label="Les Maîtres Sauciers 🧪", description="Les Supports (Fuzzy, Larry, Pepper...)", value="Les Maîtres Sauciers 🧪")
-        ]
-        super().__init__(placeholder="Choisissez votre spécialité en cuisine...", min_values=1, max_values=1, options=options)
+        options = [discord.SelectOption(label=animal, value=animal) for animal in ANIMAUX_ZOOBA]
+        super().__init__(placeholder="Choisissez votre animal principal (Main)...", min_values=1, max_values=1, options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        update_user_data(interaction.user.id, "brigade", self.values[0])
-        await interaction.response.send_message(f"👨‍🍳 Votre poste a été assigné avec succès : **{self.values[0]}** !", ephemeral=True)
+        update_user_data(interaction.user.id, "main_zooba", self.values[0])
+        embed = discord.Embed(
+            title="🐾 Animal Défini !",
+            description=f"Votre animal fétiche : **{self.values[0]}** est maintenant votre main !",
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
-class BrigadeView(discord.ui.View):
+class AnimalView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        self.add_item(BrigadeSelect())
+        self.add_item(AnimalSelect())
 
-@bot.tree.command(name="quentine_choix_brigade", description="Affiche le menu de sélection de votre brigade.")
-async def quentine_choix_brigade(interaction: discord.Interaction):
-    view = BrigadeView()
+@bot.tree.command(name="quentine_set_main", description="Définis ton animal favori (Main) sur Zooba.")
+async def quentine_set_main(interaction: discord.Interaction):
+    view = AnimalView()
     embed = discord.Embed(
-        title="🍽️ Choix de votre Brigade - La Quentine",
-        description="Sélectionnez votre rôle principal dans le restaurant via le menu ci-dessous pour intégrer votre brigade !",
+        title="🐾 Choix de votre Main Zooba",
+        description="Sélectionnez votre animal principal dans le menu ci-dessous :",
         color=discord.Color.orange()
     )
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-
-# --- 2. COMMANDE DE PROFIL ENRICHI ---
-@bot.tree.command(name="quentine_carte", description="Affiche votre profil complet de cuisinier/joueur.")
+@bot.tree.command(name="quentine_carte", description="Affiche ta carte de cuisinier complète avec tous tes badges.")
 async def quentine_carte(interaction: discord.Interaction, membre: discord.Member = None):
     target = membre or interaction.user
     u_data = get_user_data(target.id)
 
-    embed = discord.Embed(title=f"📋 Carte de Cuisine - {target.display_name}", color=discord.Color.gold())
+    embed = discord.Embed(
+        title=f"📋 Carte de Cuisine - {target.display_name}",
+        color=discord.Color.gold()
+    )
     embed.set_thumbnail(url=target.display_avatar.url)
     
-    embed.add_field(name="🪙 Pourboires", value=f"{u_data['pourboires']} 🪙", inline=True)
-    embed.add_field(name="🛡️ Brigade", value=u_data['brigade'], inline=True)
-    embed.add_field(name="🐾 Animal Main", value=u_data['main_zooba'], inline=True)
+    embed.add_field(name="🪙 Pourboires", value=f"`{u_data['pourboires']} 🪙`", inline=True)
+    embed.add_field(name="🛡️ Brigade", value=f"`{u_data['brigade']}`", inline=True)
+    embed.add_field(name="🐾 Animal Main", value=f"`{u_data['main_zooba']}`", inline=True)
     
-    embed.add_field(name="⚔️ Duels Gagnés", value=str(u_data['victoires_duels']), inline=True)
-    embed.add_field(name="⭐ Niveau Cuisine", value=f"Niveau {u_data['niveau_cuisine']} ({u_data['experience']} XP)", inline=True)
-    embed.add_field(name="💰 Gains Totaux", value=f"{u_data['total_gains']} 🪙", inline=True)
+    embed.add_field(name="⚔️ Statistiques de Duel", value=f"`Gagnés : {u_data['victoires_duels']} | Joués : {u_data['statistiques']['duels_joues']}`", inline=False)
+    embed.add_field(name="⭐ Niveau Cuisine", value=f"`Niveau {u_data['niveau_cuisine']} | {u_data['experience']} XP`", inline=True)
+    embed.add_field(name="💰 Gains Totaux", value=f"`{u_data['total_gains']} 🪙`", inline=True)
     
-    badges = ", ".join(u_data['etoiles_michelin']) if u_data['etoiles_michelin'] else "Aucune étoile pour l'instant"
-    embed.add_field(name="⭐ Étoiles Michelin", value=badges, inline=False)
+    badges = " ".join(u_data['badges_style']) if u_data['badges_style'] else "Aucun badge pour l'instant"
+    embed.add_field(name="✨ Badges & Étoiles", value=badges, inline=False)
     
-    badges_list = ", ".join(u_data['badges']) if u_data['badges'] else "Aucun badge"
-    embed.add_field(name="🎖️ Badges & Achievements", value=badges_list, inline=False)
-
     await interaction.response.send_message(embed=embed)
 
 
-# --- 3. SYSTÈME DE DUEL CULINAIRE AMÉLIORÉ ---
+# --- 3. SYSTÈME DE DUEL CULINAIRE AVANCÉ ---
 LISTE_DEFIS = [
-    "Le Défi Flambé : Faire un Top 1 avec Larry sans utiliser de trousse de secours.",
-    "Le Défi Épicé : Faire 3 kills en zone de feu ou de gaz.",
-    "Le Défi Allégé : Gagner une partie en ramassant uniquement des armes communes.",
-    "Le Défi du Chef : Assommer un adversaire avec un élément du décor ou une grenade.",
-    "Le Défi Tartare : Jouer un tank et encaisser plus de 3000 de dégâts sans mourir.",
-    "Le Défi Éclair : Remporter une victoire en moins de 5 minutes.",
-    "Le Défi Acrobate : Faire 5 éliminations sans vous faire toucher.",
-    "Le Défi Stratège : Remporter une partie sans utiliser de consommables."
+    "🔥 Le Défi Flambé : Faire un Top 1 avec Larry sans utiliser de trousse de secours.",
+    "⚡ Le Défi Épicé : Faire 3 kills en zone de feu ou de gaz.",
+    "🎯 Le Défi Allégé : Gagner une partie en ramassant uniquement des armes communes.",
+    "💣 Le Défi du Chef : Assommer un adversaire avec un élément du décor ou une grenade.",
+    "🛡️ Le Défi Tartare : Jouer un tank et encaisser plus de 3000 de dégâts sans mourir.",
+    "⚡ Le Défi Éclair : Remporter une victoire en moins de 5 minutes.",
+    "🎪 Le Défi Acrobate : Faire 5 éliminations sans vous faire toucher.",
+    "🧠 Le Défi Stratège : Remporter une partie sans utiliser de consommables."
 ]
 
 class DuelButtonView(discord.ui.View):
@@ -213,13 +234,17 @@ class DuelButtonView(discord.ui.View):
         w_data["victoires_duels"] += 1
         w_data["experience"] += 50
         w_data["total_gains"] += self.mise
+        w_data["statistiques"]["duels_gagnes"] += 1
+        w_data["statistiques"]["duels_joues"] += 1
+        
+        l_data["experience"] += 20
+        l_data["statistiques"]["duels_perdus"] += 1
+        l_data["statistiques"]["duels_joues"] += 1
         
         # Gestion du niveau
         if w_data["experience"] >= w_data["niveau_cuisine"] * 100:
             w_data["niveau_cuisine"] += 1
-            w_data["badges"].append(f"🎖️ Chef Niveau {w_data['niveau_cuisine']}")
-
-        l_data["experience"] += 20
+            w_data["badges_style"].append(f"🎖️ Chef Niveau {w_data['niveau_cuisine']}")
 
         data = load_data()
         data[str(winner.id)] = w_data
@@ -228,97 +253,79 @@ class DuelButtonView(discord.ui.View):
 
         embed = discord.Embed(
             title="🏆 Service Terminé - Vainqueur du Duel !",
-            description=f"Le chef **{winner.mention}** a validé sa preuve dans `#degustation-replays` et remporte la mise de **{self.mise} Pourboires 🪙** face à {loser.mention} !\n\n**Bonus XP :** +50 XP pour le vainqueur, +20 XP pour le perdant.",
+            description=f"Le chef **{winner.mention}** a validé sa preuve et remporte **{self.mise} Pourboires 🪙** face à {loser.mention} !\n\n**Bonus XP :** +50 XP pour le vainqueur, +20 XP pour le perdant.",
             color=discord.Color.green()
         )
         for child in self.children:
             child.disabled = True
         await interaction.message.edit(embed=embed, view=self)
-        await interaction.response.send_message(f"Victoire validée ! Bien joué chef 👨‍🍳", ephemeral=True)
+        await interaction.response.send_message(f"✅ Victoire validée ! Bien joué chef 👨‍🍳", ephemeral=True)
 
 @bot.tree.command(name="quentine_duel", description="Défie un autre membre du clan en duel culinaire avec une mise de pourboires.")
 async def quentine_duel(interaction: discord.Interaction, opponent: discord.Member, mise: int):
     if opponent == interaction.user:
-        await interaction.response.send_message("Vous ne pouvez pas cuisiner contre vous-même !", ephemeral=True)
+        await interaction.response.send_message("❌ Vous ne pouvez pas cuisiner contre vous-même !", ephemeral=True)
         return
 
     if opponent.bot:
-        await interaction.response.send_message("Vous ne pouvez pas défier un bot !", ephemeral=True)
+        await interaction.response.send_message("❌ Vous ne pouvez pas défier un bot !", ephemeral=True)
         return
 
     c_data = get_user_data(interaction.user.id)
     if c_data["pourboires"] < mise:
-        await interaction.response.send_message("Vous n'avez pas assez de Pourboires 🪙 en caisse pour cette mise !", ephemeral=True)
+        await interaction.response.send_message(f"❌ Vous n'avez pas assez de Pourboires 🪙 ! (Il vous manque {mise - c_data['pourboires']})", ephemeral=True)
         return
 
     if mise < 10:
-        await interaction.response.send_message("La mise minimale est de 10 Pourboires 🪙 !", ephemeral=True)
+        await interaction.response.send_message("❌ La mise minimale est de 10 Pourboires 🪙 !", ephemeral=True)
         return
 
     defi_choisi = random.choice(LISTE_DEFIS)
     embed = discord.Embed(
         title="⚔️ Nouveau Duel Culinaires en Cuisine !",
-        description=f"**{interaction.user.mention}** défie **{opponent.mention}** !\n\n**Mise en jeu :** {mise} Pourboires 🪙\n\n🎯 **COMMANDE DU CHEF (Défi) :**\n`{defi_choisi}`\n\n*Postez votre preuve dans #degustation-replays et cliquez sur le bouton dès que le plat est prêt !*",
+        description=f"**{interaction.user.mention}** défie **{opponent.mention}** !\n\n**Mise en jeu :** {mise} Pourboires 🪙\n\n🎯 **COMMANDE DU CHEF (Défi) :**\n{defi_choisi}\n\n*Postez votre preuve dans #degustation-replays et cliquez sur le bouton dès que le plat est prêt !*",
         color=discord.Color.red()
     )
     view = DuelButtonView(interaction.user, opponent, mise)
     await interaction.response.send_message(embed=embed, view=view)
 
-@bot.tree.command(name="quentine_historique_duels", description="Affiche l'historique de vos duels.")
-async def quentine_historique_duels(interaction: discord.Interaction, membre: discord.Member = None):
-    target = membre or interaction.user
-    u_data = get_user_data(target.id)
 
-    embed = discord.Embed(title=f"⚔️ Historique des Duels - {target.display_name}", color=discord.Color.red())
-    embed.add_field(name="Victoires Totales", value=str(u_data['victoires_duels']), inline=True)
-    embed.add_field(name="Gains Totaux", value=f"{u_data['total_gains']} 🪙", inline=True)
-    embed.add_field(name="Taux de Victoire Estimé", value="N/A (données détaillées à venir)", inline=True)
+# --- 4. CRÉATION AUTOMATIQUE DE SALONS POUR DUOS/QUADS ---
+@bot.tree.command(name="quentine_creer_salon", description="Crée un salon vocal et textuel éphémère pour votre escouade.")
+async def quentine_creer_salon(interaction: discord.Interaction, nom_groupe: str, taille: str):
+    if len(nom_groupe) > 20:
+        await interaction.response.send_message("❌ Le nom du groupe est trop long (max 20 caractères) !", ephemeral=True)
+        return
+
+    guild = interaction.guild
+    category = discord.utils.get(guild.categories, name="🎮 SALONS DE JEU")
     
-    await interaction.response.send_message(embed=embed)
+    if not category:
+        category = await guild.create_category("🎮 SALONS DE JEU")
 
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=True),
+        interaction.user: discord.PermissionOverwrite(manage_channels=True, connect=True, speak=True, send_messages=True)
+    }
 
-# --- 4. SYSTÈME DE SPÉCIALITÉS & ANIMAUX ZOOBA ---
-class SpecialiteSelect(discord.ui.Select):
-    def __init__(self):
-        options = [
-            discord.SelectOption(label="Bruce 🐻 - Le Tank", value="Bruce"),
-            discord.SelectOption(label="Nix 🐉 - L'Assassin", value="Nix"),
-            discord.SelectOption(label="Larry 🦁 - Le Support", value="Larry"),
-            discord.SelectOption(label="Jade 🦗 - La DPS Magique", value="Jade"),
-            discord.SelectOption(label="Steve 🦝 - Le Voleur", value="Steve"),
-            discord.SelectOption(label="Duke 🐕 - Le Chevalier", value="Duke"),
-            discord.SelectOption(label="Buck 🦌 - Le Ranger", value="Buck"),
-            discord.SelectOption(label="Pepper 🐰 - L'Alchimiste", value="Pepper"),
-            discord.SelectOption(label="Fuzzy 🐰 - L'Enchanteur", value="Fuzzy")
-        ]
-        super().__init__(placeholder="Choisissez votre animal principal Zooba...", min_values=1, max_values=1, options=options)
+    emoji_taille = "👥" if taille.lower() in ["duo", "2"] else "👫" if taille.lower() in ["trio", "3"] else "🏃" if taille.lower() in ["quad", "4"] else "⚔️"
 
-    async def callback(self, interaction: discord.Interaction):
-        update_user_data(interaction.user.id, "main_zooba", self.values[0])
-        update_user_data(interaction.user.id, "specialite", self.values[0])
-        await interaction.response.send_message(f"🐾 Parfait ! **{self.values[0]}** est maintenant votre animal principal !", ephemeral=True)
+    vocal = await guild.create_voice_channel(f"{emoji_taille} Escouade : {nom_groupe}", category=category, overwrites=overwrites, user_limit=int(taille) if taille.isdigit() else None)
+    textuel = await guild.create_text_channel(f"💬-chat-{nom_groupe}", category=category, overwrites=overwrites)
 
-class SpecialiteView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-        self.add_item(SpecialiteSelect())
-
-@bot.tree.command(name="quentine_choix_specialite", description="Choisissez votre animal principal Zooba.")
-async def quentine_choix_specialite(interaction: discord.Interaction):
-    view = SpecialiteView()
     embed = discord.Embed(
-        title="🐾 Choix de votre Animal Principal - Zooba",
-        description="Sélectionnez l'animal avec lequel vous dominrez le champ de bataille !",
+        title="🕹️ Salon d'Escouade Créé !",
+        description=f"✅ Votre salon vocal {vocal.mention} et textuel {textuel.mention} sont prêts pour le match !\n\n**Chef de l'équipe :** {interaction.user.mention}\n**Taille de l'escouade :** {taille} joueur(s)",
         color=discord.Color.green()
     )
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# --- 5. SYSTÈME DE SAISONS (Long Terme) ---
+# --- 5. SYSTÈME DE SAISONS COMPLET ---
 @bot.tree.command(name="quentine_saison_ouvrir", description="[Admin] Enregistre les trophées de départ de tous les membres pour la nouvelle saison.")
 async def quentine_saison_ouvrir(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé au patron du restaurant !", ephemeral=True)
+        await interaction.response.send_message("❌ Réservé au patron du restaurant !", ephemeral=True)
         return
 
     data = load_data()
@@ -328,14 +335,14 @@ async def quentine_saison_ouvrir(interaction: discord.Interaction):
         data[uid]["trophees_debut_saison"] = data[uid]["trophees_actuels"]
     
     season_data["active"] = True
-    season_data["start_date"] = str(discord.utils.utcnow())
+    season_data["start_date"] = datetime.now().isoformat()
     
     save_data(data)
     save_season_data(season_data)
 
     embed = discord.Embed(
         title="🗓️ Nouvelle Saison en Cuisine Ouverte !",
-        description="Les compteurs sont étalonnés. Que la course aux étoiles commence pour le clan **LA QUENTINE** !\n\n⏰ La saison est active, le classement se met à jour en temps réel.",
+        description="🔥 Les compteurs sont étalonnés. Que la course aux étoiles commence pour le clan **LA QUENTINE** !\n\n⏰ La saison est active, le classement se met à jour en temps réel.",
         color=discord.Color.green()
     )
     await interaction.response.send_message(embed=embed)
@@ -350,33 +357,37 @@ async def quentine_saison_classement(interaction: discord.Interaction):
         return
     
     if not data:
-        await interaction.response.send_message("Aucune donnée en cuisine pour l'instant.", ephemeral=True)
+        await interaction.response.send_message("❌ Aucune donnée en cuisine pour l'instant.", ephemeral=True)
         return
 
     classement = []
     for uid, u_info in data.items():
         progression = u_info["trophees_actuels"] - u_info["trophees_debut_saison"]
-        classement.append((uid, progression, u_info["trophees_actuels"], u_info.get("victoires_duels", 0)))
+        duels_gagnes = u_info.get("victoires_duels", 0)
+        classement.append((uid, progression, u_info["trophees_actuels"], duels_gagnes))
 
     classement.sort(key=lambda x: x[1], reverse=True)
 
-    embed = discord.Embed(title="🏆 Classement de la Brigade - Saison en Cours", color=discord.Color.gold())
+    embed = discord.Embed(
+        title="🏆 Classement de la Brigade - Saison en Cours",
+        color=discord.Color.gold()
+    )
     
     description = ""
-    for index, (uid, prog, actuels, victoires) in enumerate(classement[:15], start=1):
+    for index, (uid, prog, actuels, duels) in enumerate(classement[:15], start=1):
         member = interaction.guild.get_member(int(uid))
-        name = member.display_name if member else f"Cuisinier ID {uid}"
-        medal = "🥇" if index == 1 else "🥈" if index == 2 else "🥉" if index == 3 else f"**#{index}**"
-        description += f"{medal} **{name}** — Progression : `+{prog}` 🏆 | Duels : {victoires} ⚔️ | Total : {actuels}\n"
+        name = member.display_name if member else f"Cuisinier #{uid}"
+        medal = "🥇" if index == 1 else "🥈" if index == 2 else "🥉" if index == 3 else f"#{index}"
+        description += f"{medal} **{name}** — `+{prog}` 🏆 | Duels : `{duels}` ⚔️ | Total : `{actuels}`\n"
 
     embed.description = description if description else "Aucun classement disponible."
     embed.set_footer(text="Les 3 premiers seront récompensés à la fin de la saison !")
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="quentine_saison_cloture", description="[Admin] Clôture la saison, récompense le Top 3 et attribue le rôle Caviar 💎.")
+@bot.tree.command(name="quentine_saison_cloture", description="[Admin] Clôture la saison et récompense le Top 3.")
 async def quentine_saison_cloture(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé au patron du restaurant !", ephemeral=True)
+        await interaction.response.send_message("❌ Réservé au patron du restaurant !", ephemeral=True)
         return
 
     data = load_data()
@@ -390,7 +401,7 @@ async def quentine_saison_cloture(interaction: discord.Interaction):
     classement.sort(key=lambda x: x[1], reverse=True)
 
     if not classement:
-        await interaction.response.send_message("Personne à récompenser.", ephemeral=True)
+        await interaction.response.send_message("❌ Personne à récompenser.", ephemeral=True)
         return
 
     recompenses = [5000, 3000, 1500]
@@ -405,6 +416,7 @@ async def quentine_saison_cloture(interaction: discord.Interaction):
             data[uid]["total_gains"] += prime
             
             if i == 0:
+                data[uid]["badges_style"].append("👑 Grand Chef de Saison")
                 data[uid]["etoiles_michelin"].append("⭐ Grand Chef de Saison")
                 caviar_role = discord.utils.get(interaction.guild.roles, name="Caviar 💎")
                 if caviar_role:
@@ -413,8 +425,10 @@ async def quentine_saison_cloture(interaction: discord.Interaction):
                     except:
                         pass
             elif i == 1:
+                data[uid]["badges_style"].append("🌟 Sous Chef de Saison")
                 data[uid]["etoiles_michelin"].append("⭐ Sous Chef de Saison")
             else:
+                data[uid]["badges_style"].append("⭐ Chef de Partie de Saison")
                 data[uid]["etoiles_michelin"].append("⭐ Chef de Partie de Saison")
             
             resultats_texte += f"**Rang #{i+1}** : {member.mention}\n├─ Progression : `+{prog}` 🏆\n├─ Prime : **{prime} Pourboires 🪙**\n└─ Badge : ⭐ Étoile Michelin\n\n"
@@ -423,29 +437,36 @@ async def quentine_saison_cloture(interaction: discord.Interaction):
     save_data(data)
     save_season_data(season_data)
     
-    embed = discord.Embed(title="🛎️ Fin du Service - Clôture de Saison !", description=resultats_texte, color=discord.Color.purple())
+    embed = discord.Embed(
+        title="🛎️ Fin du Service - Clôture de Saison !",
+        description=resultats_texte,
+        color=discord.Color.purple()
+    )
     await interaction.response.send_message(embed=embed)
 
 
-# --- 6. SYSTÈME DE SHOP (Acheter des Items/Cosmétiques) ---
+# --- 6. SYSTÈME DE SHOP ---
 SHOP_ITEMS = {
-    "1": {"nom": "Costume Chef Premium 👨‍🍳", "prix": 500, "emoji": "👨‍🍳"},
-    "2": {"nom": "Auréole Dorée ✨", "prix": 300, "emoji": "✨"},
-    "3": {"nom": "Trophée Miniature 🏆", "prix": 250, "emoji": "🏆"},
-    "4": {"nom": "Parchemin Secret 📜", "prix": 400, "emoji": "📜"},
-    "5": {"nom": "Cristal Enchanté 💎", "prix": 1000, "emoji": "💎"}
+    "1": {"nom": "Costume Chef Premium", "prix": 500, "emoji": "👨‍🍳"},
+    "2": {"nom": "Auréole Dorée", "prix": 300, "emoji": "✨"},
+    "3": {"nom": "Trophée Miniature", "prix": 250, "emoji": "🏆"},
+    "4": {"nom": "Parchemin Secret", "prix": 400, "emoji": "📜"},
+    "5": {"nom": "Cristal Enchanté", "prix": 1000, "emoji": "💎"}
 }
 
 @bot.tree.command(name="quentine_shop", description="Accédez à la boutique pour acheter des cosmétiques.")
 async def quentine_shop(interaction: discord.Interaction):
     u_data = get_user_data(interaction.user.id)
     
-    embed = discord.Embed(title="🛍️ Boutique Culinaire - LA QUENTINE", color=discord.Color.purple())
-    embed.add_field(name="💰 Votre Solde", value=f"{u_data['pourboires']} 🪙", inline=False)
+    embed = discord.Embed(
+        title="🛍️ Boutique Culinaire - LA QUENTINE",
+        color=discord.Color.purple()
+    )
+    embed.add_field(name="💰 Votre Solde", value=f"`{u_data['pourboires']} 🪙`", inline=False)
     
     shop_text = ""
     for key, item in SHOP_ITEMS.items():
-        shop_text += f"**{key}. {item['nom']}** - `{item['prix']} 🪙`\n"
+        shop_text += f"**{key}.** {item['emoji']} {item['nom']} — `{item['prix']} 🪙`\n"
     
     embed.add_field(name="📦 Articles Disponibles", value=shop_text, inline=False)
     embed.set_footer(text="Utilisez /quentine_acheter <numero> pour acheter un item")
@@ -462,23 +483,24 @@ async def quentine_acheter(interaction: discord.Interaction, numero: str):
     u_data = get_user_data(interaction.user.id)
     
     if u_data["pourboires"] < item["prix"]:
-        await interaction.response.send_message(f"❌ Vous n'avez pas assez de Pourboires 🪙 ! (Il vous manque {item['prix'] - u_data['pourboires']})", ephemeral=True)
+        manque = item["prix"] - u_data["pourboires"]
+        await interaction.response.send_message(f"❌ Vous n'avez pas assez de Pourboires 🪙 ! (Il vous manque {manque})", ephemeral=True)
         return
     
     u_data["pourboires"] -= item["prix"]
-    u_data["badges"].append(item["nom"])
+    u_data["badges_style"].append(f"{item['emoji']} {item['nom']}")
     update_user_data(interaction.user.id, "pourboires", u_data["pourboires"])
-    update_user_data(interaction.user.id, "badges", u_data["badges"])
+    update_user_data(interaction.user.id, "badges_style", u_data["badges_style"])
     
     embed = discord.Embed(
         title="✅ Achat Réussi !",
-        description=f"Vous avez acheté : **{item['nom']}** {item['emoji']}\n\nSolde restant : **{u_data['pourboires']} 🪙**",
+        description=f"Vous avez acheté : **{item['emoji']} {item['nom']}**\n\nSolde restant : `{u_data['pourboires']} 🪙`",
         color=discord.Color.green()
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# --- 7. SYSTÈME DE RECRUTEMENT (#surveillance-hygiene) ---
+# --- 7. RECRUTEMENT ---
 class CandidatureModal(discord.ui.Modal, title="Candidature - La Quentine"):
     zooba_id = discord.ui.TextInput(label="Votre ID ou Pseudo Zooba", placeholder="Ex: Pseudo#1234", required=True)
     trophees = discord.ui.TextInput(label="Nombre de trophées actuels", placeholder="Ex: 15000", required=True)
@@ -488,7 +510,10 @@ class CandidatureModal(discord.ui.Modal, title="Candidature - La Quentine"):
         guild = interaction.guild
         surveillance_channel = discord.utils.get(guild.text_channels, name="surveillance-hygiene")
         
-        embed = discord.Embed(title="🕵️ Nouveau Dossier en Surveillance d'Hygiène", color=discord.Color.purple())
+        embed = discord.Embed(
+            title="🕵️ Nouveau Dossier en Surveillance d'Hygiène",
+            color=discord.Color.purple()
+        )
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
         embed.add_field(name="Candidat", value=interaction.user.mention, inline=False)
         embed.add_field(name="Pseudo Zooba", value=self.zooba_id.value, inline=True)
@@ -527,7 +552,7 @@ class RecrutementActionView(discord.ui.View):
 @bot.tree.command(name="quentine_menu_recrutement", description="[Admin] Envoie le panneau de recrutement dans le salon.")
 async def quentine_menu_recrutement(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé au patron du restaurant !", ephemeral=True)
+        await interaction.response.send_message("❌ Réservé au patron du restaurant !", ephemeral=True)
         return
 
     class OpenModalButton(discord.ui.View):
@@ -547,11 +572,32 @@ async def quentine_menu_recrutement(interaction: discord.Interaction):
     await interaction.response.send_message("✅ Panneau de recrutement déployé !", ephemeral=True)
 
 
-# --- 8. COMMANDES ADMIN UTILES ---
-@bot.tree.command(name="quentine_give_pourboires", description="[Admin] Donnez des pourboires à un membre.")
-async def quentine_give_pourboires(interaction: discord.Interaction, membre: discord.Member, montant: int):
+# --- 8. OUTILS ADMIN ---
+@bot.tree.command(name="quentine_admin_donner_badge", description="[Admin] Attribue un badge exclusif à un membre.")
+async def quentine_admin_donner_badge(interaction: discord.Interaction, membre: discord.Member, badge: str):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé au patron du restaurant !", ephemeral=True)
+        await interaction.response.send_message("❌ Réservé au chef du restaurant !", ephemeral=True)
+        return
+
+    u_data = get_user_data(membre.id)
+    if badge not in u_data["badges_style"]:
+        u_data["badges_style"].append(badge)
+        data = load_data()
+        data[str(membre.id)] = u_data
+        save_data(data)
+        embed = discord.Embed(
+            title="✨ Badge Attribué !",
+            description=f"Le badge **{badge}** a été ajouté avec succès à la carte de {membre.mention} !",
+            color=discord.Color.gold()
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Ce membre possède déjà ce badge !", ephemeral=True)
+
+@bot.tree.command(name="quentine_admin_donner_pourboires", description="[Admin] Donnez des pourboires à un membre.")
+async def quentine_admin_donner_pourboires(interaction: discord.Interaction, membre: discord.Member, montant: int):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("❌ Réservé au patron du restaurant !", ephemeral=True)
         return
     
     u_data = get_user_data(membre.id)
@@ -560,15 +606,15 @@ async def quentine_give_pourboires(interaction: discord.Interaction, membre: dis
     
     embed = discord.Embed(
         title="💰 Distribution de Pourboires",
-        description=f"{membre.mention} a reçu **{montant} Pourboires 🪙**\n\nSolde : {u_data['pourboires']} 🪙",
+        description=f"{membre.mention} a reçu **{montant} Pourboires 🪙**\n\nSolde : `{u_data['pourboires']} 🪙`",
         color=discord.Color.gold()
     )
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="quentine_reset_user", description="[Admin] Réinitialiser les données d'un utilisateur.")
-async def quentine_reset_user(interaction: discord.Interaction, membre: discord.Member):
+@bot.tree.command(name="quentine_admin_reset_user", description="[Admin] Réinitialise les données d'un utilisateur.")
+async def quentine_admin_reset_user(interaction: discord.Interaction, membre: discord.Member):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé au patron du restaurant !", ephemeral=True)
+        await interaction.response.send_message("❌ Réservé au patron du restaurant !", ephemeral=True)
         return
     
     data = load_data()
@@ -579,14 +625,19 @@ async def quentine_reset_user(interaction: discord.Interaction, membre: discord.
         "brigade": "Aucune",
         "victoires_duels": 0,
         "etoiles_michelin": [],
+        "badges_style": [],
         "trophees_debut_saison": 0,
         "trophees_actuels": 0,
         "niveau_cuisine": 1,
         "experience": 0,
-        "specialite": "Aucune",
-        "badges": [],
+        "derniere_activite": datetime.now().isoformat(),
+        "total_gains": 0,
         "historique_duels": [],
-        "total_gains": 0
+        "statistiques": {
+            "duels_joues": 0,
+            "duels_gagnes": 0,
+            "duels_perdus": 0
+        }
     }
     save_data(data)
     
@@ -595,7 +646,7 @@ async def quentine_reset_user(interaction: discord.Interaction, membre: discord.
 @bot.tree.command(name="quentine_stats_globales", description="[Admin] Affiche les stats globales du clan.")
 async def quentine_stats_globales(interaction: discord.Interaction):
     if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Réservé au patron du restaurant !", ephemeral=True)
+        await interaction.response.send_message("❌ Réservé au patron du restaurant !", ephemeral=True)
         return
     
     data = load_data()
@@ -604,30 +655,59 @@ async def quentine_stats_globales(interaction: discord.Interaction):
     total_pourboires = sum(u["pourboires"] for u in data.values())
     total_gains = sum(u.get("total_gains", 0) for u in data.values())
     total_duels = sum(u["victoires_duels"] for u in data.values())
+    total_duels_joues = sum(u["statistiques"]["duels_joues"] for u in data.values())
     
-    embed = discord.Embed(title="📊 Statistiques Globales - LA QUENTINE", color=discord.Color.blue())
-    embed.add_field(name="👥 Membres Actifs", value=str(total_membres), inline=True)
-    embed.add_field(name="🪙 Pourboires en Circulation", value=f"{total_pourboires} 🪙", inline=True)
-    embed.add_field(name="💰 Gains Totaux Générés", value=f"{total_gains} 🪙", inline=True)
-    embed.add_field(name="⚔️ Duels Joués", value=str(total_duels), inline=True)
+    embed = discord.Embed(
+        title="📊 Statistiques Globales - LA QUENTINE",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="👥 Membres Actifs", value=f"`{total_membres}`", inline=True)
+    embed.add_field(name="🪙 Pourboires en Circulation", value=f"`{total_pourboires} 🪙`", inline=True)
+    embed.add_field(name="💰 Gains Totaux Générés", value=f"`{total_gains} 🪙`", inline=True)
+    embed.add_field(name="⚔️ Duels Gagnés", value=f"`{total_duels}`", inline=True)
+    embed.add_field(name="⚔️ Duels Joués", value=f"`{total_duels_joues}`", inline=True)
+    embed.add_field(name="📈 Moyenne Duels/Membre", value=f"`{total_duels_joues // total_membres if total_membres > 0 else 0}`", inline=True)
     
     await interaction.response.send_message(embed=embed)
 
 
-# --- 9. AIDE & DOCUMENTATION ---
+# --- 9. TÂCHE DE SUIVI AUTOMATIQUE ---
+@tasks.loop(hours=24)
+async def suivi_activite():
+    data = load_data()
+    guild_id = 1234567890  # À remplacer par ton vrai Guild ID
+    bot_guild = bot.get_guild(guild_id)
+    
+    if bot_guild:
+        cutoff_date = datetime.now() - timedelta(days=30)
+        inactive_count = 0
+        
+        for uid in data:
+            try:
+                activity_date = datetime.fromisoformat(data[uid]["derniere_activite"])
+                if activity_date < cutoff_date:
+                    inactive_count += 1
+            except:
+                pass
+
+
+# --- 10. AIDE & DOCUMENTATION ---
 @bot.tree.command(name="quentine_aide", description="Affiche toutes les commandes disponibles.")
 async def quentine_aide(interaction: discord.Interaction):
-    embed = discord.Embed(title="📚 Guide Complet - LA QUENTINE", color=discord.Color.orange())
+    embed = discord.Embed(
+        title="📚 Guide Complet - LA QUENTINE",
+        color=discord.Color.orange()
+    )
     
     embed.add_field(
         name="👤 Profil & Personnalisation",
-        value="`/quentine_choix_brigade` - Choisir votre brigade\n`/quentine_choix_specialite` - Choisir votre animal Zooba\n`/quentine_carte` - Voir votre profil",
+        value="`/quentine_set_main` - Choisir votre animal Zooba\n`/quentine_carte` - Voir votre profil complet",
         inline=False
     )
     
     embed.add_field(
         name="⚔️ Combats & Compétition",
-        value="`/quentine_duel` - Défier un autre membre\n`/quentine_historique_duels` - Voir vos duels\n`/quentine_saison_classement` - Voir le classement",
+        value="`/quentine_duel` - Défier un autre membre\n`/quentine_saison_classement` - Voir le classement",
         inline=False
     )
     
@@ -639,7 +719,13 @@ async def quentine_aide(interaction: discord.Interaction):
     
     embed.add_field(
         name="🛍️ Boutique",
-        value="`/quentine_shop` - Voir la boutique\n`/quentine_acheter` - Acheter un item",
+        value="`/quentine_shop` - Voir la boutique\n`/quentine_acheter <numero>` - Acheter un item",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🕹️ Salons d'Escouade",
+        value="`/quentine_creer_salon <nom> <taille>` - Créer un salon vocal éphémère",
         inline=False
     )
     
@@ -650,8 +736,8 @@ async def quentine_aide(interaction: discord.Interaction):
     )
     
     embed.add_field(
-        name="📊 Admin",
-        value="`/quentine_stats_globales` - Voir les stats du clan\n`/quentine_give_pourboires` - Donner des pourboires\n`/quentine_reset_user` - Réinitialiser un membre",
+        name="⚙️ Admin",
+        value="`/quentine_stats_globales` - Voir les stats du clan\n`/quentine_admin_donner_pourboires` - Donner des pourboires\n`/quentine_admin_donner_badge` - Attribuer un badge\n`/quentine_admin_reset_user` - Réinitialiser un membre",
         inline=False
     )
     
@@ -661,9 +747,9 @@ async def quentine_aide(interaction: discord.Interaction):
         inline=False
     )
     
+    embed.set_footer(text="Pour plus d'aide, contactez les admins du clan !")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-# ⚠️ N'oublie pas d'ajouter la bibliothèque googletrans dans ton fichier requirements.txt
-# Lancement du bot
+# --- LANCEMENT DU BOT ---
 bot.run("mets_ton_token_discord_ici")
